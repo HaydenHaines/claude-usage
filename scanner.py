@@ -9,6 +9,8 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
+import cowork
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 DB_PATH = Path.home() / ".claude" / "usage.db"
@@ -364,10 +366,16 @@ def insert_turns(conn, turns):
     ])
 
 
+def delete_session_turns(conn, session_ids):
+    for session_id in session_ids:
+        conn.execute("DELETE FROM turns WHERE session_id = ?", (session_id,))
+
+
 def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
 
+    include_cowork = projects_dir is None and projects_dirs is None
     if projects_dirs:
         dirs_to_scan = [Path(d) for d in projects_dirs]
     elif projects_dir:
@@ -382,6 +390,11 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         if verbose:
             print(f"Scanning {d} ...")
         jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
+    if include_cowork:
+        audit_dir = cowork.cowork_sessions_dir()
+        if audit_dir and verbose:
+            print(f"Scanning {audit_dir} ...")
+        jsonl_files.extend(str(path) for path in cowork.find_audit_files(audit_dir))
     jsonl_files.sort()
 
     new_files = 0
@@ -412,7 +425,10 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
 
         if is_new:
             # New file: full parse (single read, returns line count)
-            session_metas, turns, line_count = parse_jsonl_file(filepath)
+            if cowork.is_audit_file(filepath):
+                session_metas, turns, line_count = cowork.parse_audit_file(filepath)
+            else:
+                session_metas, turns, line_count = parse_jsonl_file(filepath)
 
             if turns or session_metas:
                 sessions = aggregate_sessions(session_metas, turns)
@@ -424,122 +440,135 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
                 new_files += 1
 
         else:
-            # Updated file: read once, process only new lines
-            old_lines = row["lines"] if row else 0
-            seen_messages = {}  # message_id -> turn (dedup streaming)
-            turns_no_id = []
-            new_session_metas = {}
-            line_count = 0
+            if cowork.is_audit_file(filepath):
+                session_metas, turns, line_count = cowork.parse_audit_file(filepath)
+                if turns or session_metas:
+                    session_ids = [meta["session_id"] for meta in session_metas]
+                    delete_session_turns(conn, session_ids)
+                    sessions = aggregate_sessions(session_metas, turns)
+                    upsert_sessions(conn, sessions)
+                    insert_turns(conn, turns)
+                    for s in sessions:
+                        total_sessions.add(s["session_id"])
+                    total_turns += len(turns)
+                updated_files += 1
+            else:
+                # Updated file: read once, process only new lines
+                old_lines = row["lines"] if row else 0
+                seen_messages = {}  # message_id -> turn (dedup streaming)
+                turns_no_id = []
+                new_session_metas = {}
+                line_count = 0
 
-            try:
-                with open(filepath, encoding="utf-8", errors="replace") as f:
-                    for line_count, line in enumerate(f, 1):
-                        if line_count <= old_lines:
-                            continue
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        session_id = record.get("sessionId")
-                        if not session_id:
-                            continue
-
-                        # Initialise meta on first sight, regardless of record type
-                        if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(record.get("cwd", "")),
-                                "first_timestamp": record.get("timestamp", ""),
-                                "last_timestamp": record.get("timestamp", ""),
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                                "custom_title": None,
-                                "agent_name": None,
-                            }
-
-                        # Capture session_name updates from any record
-                        meta = new_session_metas[session_id]
-                        meta["custom_title"], meta["agent_name"] = extract_session_name(
-                            record, meta["custom_title"], meta["agent_name"]
-                        )
-
-                        rtype = record.get("type")
-                        if rtype not in ("assistant", "user"):
-                            continue
-
-                        timestamp = record.get("timestamp", "")
-                        cwd = record.get("cwd", "")
-
-                        if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                            meta["last_timestamp"] = timestamp
-                        if cwd and (not meta["project_name"] or meta["project_name"] == "unknown"):
-                            meta["project_name"] = project_name_from_cwd(cwd)
-
-                        if rtype == "assistant":
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            model = msg.get("model", "")
-                            message_id = msg.get("id", "")
-
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                try:
+                    with open(filepath, encoding="utf-8", errors="replace") as f:
+                        for line_count, line in enumerate(f, 1):
+                            if line_count <= old_lines:
+                                continue
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                record = json.loads(line)
+                            except json.JSONDecodeError:
                                 continue
 
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
+                            session_id = record.get("sessionId")
+                            if not session_id:
+                                continue
 
-                            if model:
-                                new_session_metas[session_id]["model"] = model
+                            # Initialise meta on first sight, regardless of record type
+                            if session_id not in new_session_metas:
+                                new_session_metas[session_id] = {
+                                    "session_id": session_id,
+                                    "project_name": project_name_from_cwd(record.get("cwd", "")),
+                                    "first_timestamp": record.get("timestamp", ""),
+                                    "last_timestamp": record.get("timestamp", ""),
+                                    "git_branch": record.get("gitBranch", ""),
+                                    "model": None,
+                                    "custom_title": None,
+                                    "agent_name": None,
+                                }
 
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": timestamp,
-                                "model": model,
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": cwd,
-                                "message_id": message_id,
-                            }
+                            # Capture session_name updates from any record
+                            meta = new_session_metas[session_id]
+                            meta["custom_title"], meta["agent_name"] = extract_session_name(
+                                record, meta["custom_title"], meta["agent_name"]
+                            )
 
-                            if message_id:
-                                seen_messages[message_id] = turn
-                            else:
-                                turns_no_id.append(turn)
-            except Exception as e:
-                print(f"  Warning: {e}")
+                            rtype = record.get("type")
+                            if rtype not in ("assistant", "user"):
+                                continue
 
-            if line_count <= old_lines:
-                # File didn't grow (mtime changed but no new content)
-                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                             (mtime, filepath))
-                conn.commit()
-                skipped_files += 1
-                continue
+                            timestamp = record.get("timestamp", "")
+                            cwd = record.get("cwd", "")
 
-            new_turns = turns_no_id + list(seen_messages.values())
+                            if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
+                                meta["last_timestamp"] = timestamp
+                            if cwd and (not meta["project_name"] or meta["project_name"] == "unknown"):
+                                meta["project_name"] = project_name_from_cwd(cwd)
 
-            if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(new_turns)
-            updated_files += 1
+                            if rtype == "assistant":
+                                msg = record.get("message", {})
+                                usage = msg.get("usage", {})
+                                model = msg.get("model", "")
+                                message_id = msg.get("id", "")
+
+                                input_tokens = usage.get("input_tokens", 0) or 0
+                                output_tokens = usage.get("output_tokens", 0) or 0
+                                cache_read = usage.get("cache_read_input_tokens", 0) or 0
+                                cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+
+                                if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                                    continue
+
+                                tool_name = None
+                                for item in msg.get("content", []):
+                                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                                        tool_name = item.get("name")
+                                        break
+
+                                if model:
+                                    new_session_metas[session_id]["model"] = model
+
+                                turn = {
+                                    "session_id": session_id,
+                                    "timestamp": timestamp,
+                                    "model": model,
+                                    "input_tokens": input_tokens,
+                                    "output_tokens": output_tokens,
+                                    "cache_read_tokens": cache_read,
+                                    "cache_creation_tokens": cache_creation,
+                                    "tool_name": tool_name,
+                                    "cwd": cwd,
+                                    "message_id": message_id,
+                                }
+
+                                if message_id:
+                                    seen_messages[message_id] = turn
+                                else:
+                                    turns_no_id.append(turn)
+                except Exception as e:
+                    print(f"  Warning: {e}")
+
+                if line_count <= old_lines:
+                    # File didn't grow (mtime changed but no new content)
+                    conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
+                                 (mtime, filepath))
+                    conn.commit()
+                    skipped_files += 1
+                    continue
+
+                new_turns = turns_no_id + list(seen_messages.values())
+
+                if new_turns or new_session_metas:
+                    sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
+                    upsert_sessions(conn, sessions)
+                    insert_turns(conn, new_turns)
+                    for s in sessions:
+                        total_sessions.add(s["session_id"])
+                    total_turns += len(new_turns)
+                updated_files += 1
 
         # Record file as processed (line_count already known from the single read)
         conn.execute("""

@@ -6,7 +6,9 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import cowork
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
     aggregate_sessions, upsert_sessions, insert_turns, scan,
@@ -87,6 +89,25 @@ def _make_user_record(session_id="sess-1", timestamp="2026-04-08T09:59:00Z",
         "sessionId": session_id,
         "timestamp": timestamp,
         "cwd": cwd,
+    })
+
+
+def _make_audit_result(session_id="abc12345-session", timestamp="2026-04-25T12:00:03Z",
+                       model_usage=None):
+    return json.dumps({
+        "type": "result",
+        "session_id": session_id,
+        "_audit_timestamp": timestamp,
+        "total_cost_usd": 0.42,
+        "modelUsage": model_usage or {
+            "claude-opus-4-7": {
+                "inputTokens": 100,
+                "outputTokens": 200,
+                "cacheReadInputTokens": 1000,
+                "cacheCreationInputTokens": 50,
+                "costUSD": 0.40,
+            }
+        },
     })
 
 
@@ -180,6 +201,117 @@ class TestParseJsonlFile(unittest.TestCase):
         path = self._write_jsonl("test.jsonl", [record])
         _, turns, _ = parse_jsonl_file(path)
         self.assertEqual(turns[0]["tool_name"], "Read")
+
+
+class TestCoworkAuditPaths(unittest.TestCase):
+    def test_macos_path(self):
+        with patch("cowork.sys.platform", "darwin"), patch.object(Path, "home", return_value=Path("/Users/me")):
+            self.assertEqual(
+                cowork.cowork_sessions_dir(),
+                Path("/Users/me/Library/Application Support/Claude/local-agent-mode-sessions"),
+            )
+
+    def test_windows_path(self):
+        with patch("cowork.sys.platform", "win32"), patch.dict(os.environ, {"APPDATA": "C:\\Users\\me\\AppData\\Roaming"}):
+            self.assertEqual(
+                cowork.cowork_sessions_dir(),
+                Path("C:\\Users\\me\\AppData\\Roaming") / "Claude" / "local-agent-mode-sessions",
+            )
+
+    def test_windows_without_appdata_returns_none(self):
+        with patch("cowork.sys.platform", "win32"), patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(cowork.cowork_sessions_dir())
+
+    def test_linux_path_uses_xdg_config_home(self):
+        with patch("cowork.sys.platform", "linux"), patch.dict(os.environ, {"XDG_CONFIG_HOME": "/tmp/config"}):
+            self.assertEqual(
+                cowork.cowork_sessions_dir(),
+                Path("/tmp/config/Claude/local-agent-mode-sessions"),
+            )
+
+    def test_linux_path_defaults_to_home_config(self):
+        with patch("cowork.sys.platform", "linux"), patch.dict(os.environ, {}, clear=True), patch.object(Path, "home", return_value=Path("/home/me")):
+            self.assertEqual(
+                cowork.cowork_sessions_dir(),
+                Path("/home/me/.config/Claude/local-agent-mode-sessions"),
+            )
+
+
+class TestParseCoworkAuditFile(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _write_audit(self, lines):
+        path = Path(self.tmpdir) / "audit.jsonl"
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return path
+
+    def test_result_model_usage_becomes_turns(self):
+        path = self._write_audit([_make_audit_result()])
+        metas, turns, line_count = cowork.parse_audit_file(path)
+
+        self.assertEqual(line_count, 1)
+        self.assertEqual(len(metas), 1)
+        self.assertEqual(metas[0]["session_id"], "abc12345-session")
+        self.assertEqual(metas[0]["project_name"], "Cowork/abc12345")
+        self.assertEqual(metas[0]["first_timestamp"], "2026-04-25T12:00:03Z")
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["model"], "claude-opus-4-7")
+        self.assertEqual(turns[0]["input_tokens"], 100)
+        self.assertEqual(turns[0]["output_tokens"], 200)
+        self.assertEqual(turns[0]["cache_read_tokens"], 1000)
+        self.assertEqual(turns[0]["cache_creation_tokens"], 50)
+        self.assertEqual(turns[0]["message_id"], "cowork:abc12345-session:claude-opus-4-7")
+
+    def test_tier_hints_are_stripped_and_merged(self):
+        path = self._write_audit([_make_audit_result(model_usage={
+            "claude-haiku-4-5[1m]": {
+                "inputTokens": 100,
+                "outputTokens": 10,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+            },
+            "claude-haiku-4-5": {
+                "inputTokens": 50,
+                "outputTokens": 5,
+                "cacheReadInputTokens": 3,
+                "cacheCreationInputTokens": 2,
+            },
+        })])
+        _, turns, _ = cowork.parse_audit_file(path)
+
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["model"], "claude-haiku-4-5")
+        self.assertEqual(turns[0]["input_tokens"], 150)
+        self.assertEqual(turns[0]["output_tokens"], 15)
+        self.assertEqual(turns[0]["cache_read_tokens"], 3)
+        self.assertEqual(turns[0]["cache_creation_tokens"], 2)
+
+    def test_last_result_for_session_wins(self):
+        path = self._write_audit([
+            _make_audit_result(model_usage={
+                "claude-opus-4-7": {
+                    "inputTokens": 100,
+                    "outputTokens": 10,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                },
+            }),
+            _make_audit_result(timestamp="2026-04-25T12:10:00Z", model_usage={
+                "claude-opus-4-7": {
+                    "inputTokens": 200,
+                    "outputTokens": 20,
+                    "cacheReadInputTokens": 0,
+                    "cacheCreationInputTokens": 0,
+                },
+            }),
+        ])
+        metas, turns, _ = cowork.parse_audit_file(path)
+
+        self.assertEqual(metas[0]["last_timestamp"], "2026-04-25T12:10:00Z")
+        self.assertEqual(turns[0]["input_tokens"], 200)
 
 
 class TestMessageIdDedup(unittest.TestCase):
@@ -453,6 +585,7 @@ class TestScanIntegration(unittest.TestCase):
         self.projects_dir = Path(self.tmpdir) / "projects"
         self.projects_dir.mkdir()
         self.db_path = Path(self.tmpdir) / "usage.db"
+        self.audit_dir = Path(self.tmpdir) / "Claude" / "local-agent-mode-sessions"
 
     def _write_project_jsonl(self, project_name, session_id, num_turns=3):
         project_dir = self.projects_dir / project_name
@@ -496,6 +629,79 @@ class TestScanIntegration(unittest.TestCase):
         self.assertEqual(result["new"], 2)
         self.assertEqual(result["turns"], 6)
         self.assertEqual(result["sessions"], 2)
+
+    def test_default_scan_includes_cowork_audits(self):
+        session_dir = self.audit_dir / "device" / "account" / "local_abc12345-session"
+        session_dir.mkdir(parents=True)
+        with open(session_dir / "audit.jsonl", "w") as f:
+            f.write(_make_audit_result() + "\n")
+
+        with patch("scanner.DEFAULT_PROJECTS_DIRS", [self.projects_dir]), \
+             patch("cowork.cowork_sessions_dir", return_value=self.audit_dir):
+            result = scan(db_path=self.db_path, verbose=False)
+
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(result["turns"], 1)
+        self.assertEqual(result["sessions"], 1)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT * FROM sessions WHERE session_id = ?", ("abc12345-session",)).fetchone()
+        turn = conn.execute("SELECT * FROM turns WHERE session_id = ?", ("abc12345-session",)).fetchone()
+        conn.close()
+        self.assertEqual(session["project_name"], "Cowork/abc12345")
+        self.assertEqual(session["total_input_tokens"], 100)
+        self.assertEqual(turn["model"], "claude-opus-4-7")
+
+    def test_explicit_scan_dir_does_not_include_cowork_audits(self):
+        session_dir = self.audit_dir / "device" / "account" / "local_abc12345-session"
+        session_dir.mkdir(parents=True)
+        with open(session_dir / "audit.jsonl", "w") as f:
+            f.write(_make_audit_result() + "\n")
+
+        with patch("cowork.cowork_sessions_dir", return_value=self.audit_dir):
+            result = scan(projects_dir=self.projects_dir, db_path=self.db_path, verbose=False)
+
+        self.assertEqual(result["new"], 0)
+        self.assertEqual(result["turns"], 0)
+
+    def test_updated_cowork_audit_replaces_cumulative_totals(self):
+        session_dir = self.audit_dir / "device" / "account" / "local_abc12345-session"
+        session_dir.mkdir(parents=True)
+        audit_path = session_dir / "audit.jsonl"
+        with open(audit_path, "w") as f:
+            f.write(_make_audit_result() + "\n")
+
+        with patch("scanner.DEFAULT_PROJECTS_DIRS", [self.projects_dir]), \
+             patch("cowork.cowork_sessions_dir", return_value=self.audit_dir):
+            scan(db_path=self.db_path, verbose=False)
+
+            import time
+            time.sleep(0.05)
+            with open(audit_path, "a") as f:
+                f.write(_make_audit_result(model_usage={
+                    "claude-opus-4-7": {
+                        "inputTokens": 300,
+                        "outputTokens": 400,
+                        "cacheReadInputTokens": 500,
+                        "cacheCreationInputTokens": 60,
+                    }
+                }) + "\n")
+            result = scan(db_path=self.db_path, verbose=False)
+
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["turns"], 1)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT * FROM sessions WHERE session_id = ?", ("abc12345-session",)).fetchone()
+        turn_count = conn.execute("SELECT COUNT(*) FROM turns WHERE session_id = ?", ("abc12345-session",)).fetchone()[0]
+        conn.close()
+        self.assertEqual(turn_count, 1)
+        self.assertEqual(session["total_input_tokens"], 300)
+        self.assertEqual(session["total_output_tokens"], 400)
+        self.assertEqual(session["total_cache_read"], 500)
+        self.assertEqual(session["total_cache_creation"], 60)
 
 
 class TestScanIncrementalUpdate(unittest.TestCase):

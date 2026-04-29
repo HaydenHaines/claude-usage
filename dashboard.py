@@ -1291,7 +1291,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 db_path.unlink()
             result = scanner.scan(
                 db_path=db_path,
-                projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
                 verbose=False,
             )
             body = json.dumps(result).encode("utf-8")
