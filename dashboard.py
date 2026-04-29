@@ -9,7 +9,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 
+from pricing import PRICING
+
 DB_PATH = Path.home() / ".claude" / "usage.db"
+PRICING_JSON_PLACEHOLDER = "/*__PRICING_JSON__*/"
 
 
 def get_dashboard_data(db_path=DB_PATH):
@@ -433,17 +436,7 @@ function tzDisplayName(tzMode) {
 }
 
 // ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
-const PRICING = {
-  'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-opus-4-5':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
-  'claude-sonnet-4-7': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-6': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-sonnet-4-5': { input:  3.00, output: 15.00, cache_write:  3.75, cache_read: 0.30 },
-  'claude-haiku-4-7':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-  'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
-};
+const PRICING = /*__PRICING_JSON__*/;
 
 function isBillable(model) {
   if (!model) return false;
@@ -1255,6 +1248,13 @@ scheduleAutoRefresh();
 """
 
 
+def render_html():
+    return HTML_TEMPLATE.replace(
+        PRICING_JSON_PLACEHOLDER,
+        json.dumps(PRICING),
+    ).encode("utf-8")
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -1264,7 +1264,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+            self.wfile.write(render_html())
 
         elif self.path == "/api/data":
             data = get_dashboard_data()

@@ -6,12 +6,19 @@ import re
 import sqlite3
 import tempfile
 import threading
+import json
 import unittest
 import urllib.request
 from pathlib import Path
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns
-from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
+from dashboard import (
+    get_dashboard_data,
+    DashboardHandler,
+    HTML_TEMPLATE,
+    PRICING_JSON_PLACEHOLDER,
+    render_html,
+)
 
 from http.server import ThreadingHTTPServer
 
@@ -373,39 +380,18 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn(": 90", get_bounds)
 
 
-class TestPricingParity(unittest.TestCase):
-    """Verify CLI and dashboard pricing tables stay in sync."""
+class TestPricingInjection(unittest.TestCase):
+    """Verify dashboard pricing is generated from the Python source."""
 
-    def _extract_js_pricing(self):
-        """Extract pricing values from the dashboard JS PRICING object."""
-        import re
-        prices = {}
-        for match in re.finditer(
-            r"'(claude-[^']+)':\s*\{\s*input:\s*([\d.]+),\s*output:\s*([\d.]+)",
-            HTML_TEMPLATE
-        ):
-            model, inp, out = match.group(1), float(match.group(2)), float(match.group(3))
-            prices[model] = {"input": inp, "output": out}
-        return prices
+    def test_template_uses_pricing_placeholder(self):
+        self.assertIn(f"const PRICING = {PRICING_JSON_PLACEHOLDER};", HTML_TEMPLATE)
 
-    def test_all_cli_models_in_dashboard(self):
-        from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
-        for model in CLI_PRICING:
-            self.assertIn(model, js_prices, f"{model} missing from dashboard JS")
+    def test_rendered_html_injects_python_pricing(self):
+        from pricing import PRICING
 
-    def test_prices_match(self):
-        from cli import PRICING as CLI_PRICING
-        js_prices = self._extract_js_pricing()
-        for model in CLI_PRICING:
-            self.assertAlmostEqual(
-                CLI_PRICING[model]["input"], js_prices[model]["input"],
-                msg=f"{model} input price mismatch"
-            )
-            self.assertAlmostEqual(
-                CLI_PRICING[model]["output"], js_prices[model]["output"],
-                msg=f"{model} output price mismatch"
-            )
+        html = render_html().decode("utf-8")
+        self.assertNotIn(PRICING_JSON_PLACEHOLDER, html)
+        self.assertIn(f"const PRICING = {json.dumps(PRICING)};", html)
 
 
 if __name__ == "__main__":
