@@ -287,6 +287,27 @@ class TestDashboardHTTP(unittest.TestCase):
         except urllib.error.HTTPError as e:
             self.assertEqual(e.code, 404)
 
+    def test_bookmarkable_url_range_all(self):
+        """GH#80: /?range=all must not 404 — query string must be stripped before routing."""
+        url = f"http://127.0.0.1:{self.port}/?range=all"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+
+    def test_bookmarkable_url_range_30d(self):
+        """GH#80: /?range=30d must not 404."""
+        url = f"http://127.0.0.1:{self.port}/?range=30d"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+
+    def test_api_data_with_cachebust_query_string(self):
+        """GH#80: /api/data?cachebust=1 must not 404."""
+        url = f"http://127.0.0.1:{self.port}/api/data?cachebust=1"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("application/json", resp.headers["Content-Type"])
+
 
 class TestHTMLTemplate(unittest.TestCase):
     def _extract_js_function(self, name):
