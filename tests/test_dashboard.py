@@ -13,10 +13,7 @@ from pathlib import Path
 from scanner import get_db, init_db, upsert_sessions, insert_turns
 from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
 
-try:
-    from http.server import HTTPServer
-except ImportError:
-    HTTPServer = None
+from http.server import ThreadingHTTPServer
 
 
 class TestGetDashboardData(unittest.TestCase):
@@ -193,7 +190,7 @@ class TestDashboardHTTP(unittest.TestCase):
         for (mod, name), (_orig, new) in cls._patches.items():
             setattr(mod, name, new)
 
-        cls.server = HTTPServer(("127.0.0.1", 0), DashboardHandler)
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), DashboardHandler)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever)
         cls.thread.daemon = True
@@ -211,6 +208,49 @@ class TestDashboardHTTP(unittest.TestCase):
         with urllib.request.urlopen(url) as resp:
             self.assertEqual(resp.status, 200)
             self.assertIn("text/html", resp.headers["Content-Type"])
+
+    def test_index_responds_while_api_data_request_is_in_flight(self):
+        import dashboard as _d
+
+        original_get_dashboard_data = _d.get_dashboard_data
+        api_started = threading.Event()
+        release_api = threading.Event()
+        api_result = {}
+
+        def slow_get_dashboard_data():
+            api_started.set()
+            release_api.wait(timeout=5)
+            return {"all_models": [], "daily_by_model": [], "sessions_all": []}
+
+        def request_api_data():
+            try:
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.port}/api/data",
+                    timeout=5,
+                ) as resp:
+                    api_result["status"] = resp.status
+            except Exception as exc:
+                api_result["error"] = exc
+
+        _d.get_dashboard_data = slow_get_dashboard_data
+        api_thread = threading.Thread(target=request_api_data)
+        api_thread.start()
+
+        try:
+            self.assertTrue(api_started.wait(timeout=2))
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/",
+                timeout=1,
+            ) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertIn("text/html", resp.headers["Content-Type"])
+        finally:
+            release_api.set()
+            api_thread.join(timeout=5)
+            _d.get_dashboard_data = original_get_dashboard_data
+
+        self.assertEqual(api_result.get("status"), 200)
+        self.assertNotIn("error", api_result)
 
     def test_api_data_returns_json(self):
         url = f"http://127.0.0.1:{self.port}/api/data"
